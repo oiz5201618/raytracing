@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 
 #include "math-toolkit.h"
 #include "primitives.h"
@@ -10,6 +11,7 @@
 #define MAX_DISTANCE 1000000000000.0
 #define MIN_DISTANCE 0.00001
 #define SAMPLES 4
+#define THREAD_NUM 64
 
 #define SQUARE(x) (x * x)
 #define MAX(a, b) (a > b ? a : b)
@@ -17,6 +19,32 @@
 /* @param t t distance
  * @return 1 means hit, otherwise 0
  */
+typedef struct {
+
+	uint8_t *pixels;
+	double* background_color;
+	rectangular_node rectangulars;
+	sphere_node spheres;
+	light_node lights;
+	const viewpoint *view;
+	int width;
+	int height;
+	double* u;
+	double* v;
+	double* w;
+	double* d;
+	int factor;
+
+} Thread_parameter;
+
+typedef struct {
+	
+	int height1;
+	int height2;
+	Thread_parameter *ptr;
+
+} Thread_range;
+
 static int raySphereIntersection(const point3 ray_e,
                                  const point3 ray_d,
                                  const sphere *sph,
@@ -452,47 +480,113 @@ static unsigned int ray_color(const point3 e, double t,
     return 1;
 }
 
+static void *parallel (void* range1)
+{
+    Thread_range *range = (Thread_range *)range1;
+
+    point3 d;
+    idx_stack stk;
+    color object_color = { 0.0, 0.0, 0.0 };
+
+    for (int j = range->height1; j < range->height2; j++) {
+        for (int i = 0; i < range->ptr->width; i++) {
+            double r = 0, g = 0, b = 0;
+            /* MSAA */
+            for (int s = 0; s < SAMPLES; s++) {
+                idx_stack_init(&stk);
+                rayConstruction(d, range->ptr->u,
+				range->ptr->v, range->ptr->w,
+                                i * range->ptr->factor + s / range->ptr->factor,
+                                j * range->ptr->factor + s % range->ptr->factor,
+                                range->ptr->view,
+                                range->ptr->width * range->ptr->factor, 
+				range->ptr->height * range->ptr->factor);
+                if (ray_color(range->ptr->view->vrp, 0.0, d,
+			      &(stk), range->ptr->rectangulars,
+			      range->ptr->spheres,
+                              range->ptr->lights, object_color,
+                              MAX_REFLECTION_BOUNCES)) {
+                    r += object_color[0];
+                    g += object_color[1];
+                    b += object_color[2];
+                } else {
+                    r += range->ptr->background_color[0];
+                    g += range->ptr->background_color[1];
+                    b += range->ptr->background_color[2];
+                }
+                range->ptr->pixels[((i + (j * range->ptr->width)) * 3) + 0] = r * 255 / SAMPLES;
+                range->ptr->pixels[((i + (j * range->ptr->width)) * 3) + 1] = g * 255 / SAMPLES;
+                range->ptr->pixels[((i + (j * range->ptr->width)) * 3) + 2] = b * 255 / SAMPLES;
+            }
+        }
+    }
+	return NULL;
+}
+
+
 /* @param background_color this is not ambient light */
 void raytracing(uint8_t *pixels, color background_color,
                 rectangular_node rectangulars, sphere_node spheres,
                 light_node lights, const viewpoint *view,
                 int width, int height)
 {
-    point3 u, v, w, d;
-    color object_color = { 0.0, 0.0, 0.0 };
+    point3 u, v, w;
+
+	int height_divide[THREAD_NUM+1];
+	pthread_t id[THREAD_NUM];
+	Thread_parameter para;
+	Thread_range range[THREAD_NUM];
 
     /* calculate u, v, w */
     calculateBasisVectors(u, v, w, view);
 
-    idx_stack stk;
-
     int factor = sqrt(SAMPLES);
-    for (int j = 0; j < height; j++) {
-        for (int i = 0; i < width; i++) {
-            double r = 0, g = 0, b = 0;
-            /* MSAA */
-            for (int s = 0; s < SAMPLES; s++) {
-                idx_stack_init(&stk);
-                rayConstruction(d, u, v, w,
-                                i * factor + s / factor,
-                                j * factor + s % factor,
-                                view,
-                                width * factor, height * factor);
-                if (ray_color(view->vrp, 0.0, d, &stk, rectangulars, spheres,
-                              lights, object_color,
-                              MAX_REFLECTION_BOUNCES)) {
-                    r += object_color[0];
-                    g += object_color[1];
-                    b += object_color[2];
-                } else {
-                    r += background_color[0];
-                    g += background_color[1];
-                    b += background_color[2];
-                }
-                pixels[((i + (j * width)) * 3) + 0] = r * 255 / SAMPLES;
-                pixels[((i + (j * width)) * 3) + 1] = g * 255 / SAMPLES;
-                pixels[((i + (j * width)) * 3) + 2] = b * 255 / SAMPLES;
-            }
+
+    for(int i=0; i<=THREAD_NUM; i++) {
+	height_divide[i] = height * i / THREAD_NUM;
+    }
+
+	para.factor = factor;
+	para.u = u;
+	para.v = v;
+	para.w = w;
+        para.pixels = pixels;
+	para.background_color = background_color;
+	para.rectangulars = rectangulars;
+	para.spheres = spheres;
+	para.lights = lights;
+	para.view = view;
+	para.width = width;
+	para.height = height;
+
+    for(int i=0; i<THREAD_NUM; i++) {
+        range[i].height1 = height_divide[i];
+	range[i].height2 = height_divide[i+1];
+	range[i].ptr = &para;
+    }
+
+    for(int i=0; i<THREAD_NUM; i++) {
+        if(pthread_create(id+i, NULL, parallel, &range[i])) {
+            printf("Thread created fail.\n");
+            exit(1);
         }
     }
+
+    for(int i=0; i<THREAD_NUM; i++) {
+        pthread_join(id[i], NULL);
+    }
+
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
